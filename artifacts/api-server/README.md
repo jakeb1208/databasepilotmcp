@@ -1,7 +1,7 @@
-Human written README:
+Human written README - Jake Bergeron:
 
 Database pilot is an mcp server that it multi user. It is read only.
-Database connections are made at https://workspaceapi-server-production-811c.up.railway.app/. 
+Database connections are made at https://workspaceapi-server-production-811c.up.railway.app/. The MCP endpoint is https://workspaceapi-server-production-811c.up.railway.app/api/mcp
 
 Database pilot gives an AI agent scoped, read-only access to a selected database without exposing its saved credentials, and the Agent can answer developers' database questions regarding public info.
 
