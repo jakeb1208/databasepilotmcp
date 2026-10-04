@@ -1,1 +1,0 @@
-- [pnpm workspace installs](pnpm-workspace-installs.md) — scope dependency changes to a leaf package, then reconcile workspace links before typechecking.
