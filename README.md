@@ -1,2 +1,0 @@
-# databasepilotmcp
-see README
