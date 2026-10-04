@@ -1,0 +1,111 @@
+Make your Railway server accessible
+
+Your server needs a public HTTPS endpoint, for example:
+
+https://your-server.up.railway.app/mcp
+
+Your code must support a remote MCP transport, such as Streamable HTTP. Simply deploying a Python or Node.js server on Railway does not automatically make it an MCP server.
+
+Create a way for users to connect their databases
+
+Initially, build a simple website or setup page where users can:
+
+Enter their database type.
+
+Enter their connection details.
+
+Test their connection.
+
+Save the connection securely.
+
+For your first version, I'd support PostgreSQL only. You can add MySQL and other database types later.
+
+Add user accounts and authentication
+
+Each user should have an account and a unique identity.
+
+When a user configures your MCP server in their AI client, the server needs to recognize them. One straightforward initial approach is a unique, revocable API token per user.
+
+For example:
+
+User A gets token A.
+
+User B gets token B.
+
+The server maps token A to User A's database credentials.
+
+The server maps token B to User B's database credentials.
+
+This is an initial implementation approach, not a substitute for considering OAuth support if you intend to support clients that expect an OAuth-based authorization flow.
+
+Build the database tools
+
+Your MCP server should expose tools such as:
+
+Tool
+
+	
+
+Purpose
+
+
+
+
+list_tables
+
+	
+
+Show available tables
+
+
+
+
+describe_table
+
+	
+
+Show columns and data types
+
+
+
+
+run_query
+
+	
+
+Run an authorized read-only SQL query
+
+
+
+
+get_schema
+
+	
+
+Retrieve the database schema
+
+For a first version, keep the tools read-only. You can avoid many unnecessary security risks by preventing modifications to customers' databases.
+
+Make the server route requests to the right database
+
+When an AI agent calls list_tables, your server should:
+
+Authenticate the request.
+
+Identify the user.
+
+Retrieve the user's saved database connection.
+
+Establish or reuse a secure connection.
+
+Run the tool.
+
+Return the results to the AI agent.
+
+This is the core functionality that makes your server multi-user.
+
+Give users manual setup instructions
+
+After a user has registered and connected a database, show them the MCP URL and the required authentication configuration for their chosen AI client.
+
+They paste the details into their client, connect, and start asking questions about their database.
