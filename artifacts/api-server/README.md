@@ -3,7 +3,16 @@ Human written README:
 Database pilot is an mcp server that it multi user. It is read only.
 Database connections are made at https://workspaceapi-server-production-811c.up.railway.app/. 
 
-Database pilot gives an AI agent scoped, read-only access to a selected database without exposing its saved credentials.
+Database pilot gives an AI agent scoped, read-only access to a selected database without exposing its saved credentials, and the Agent can answer developers' database questions regarding public info.
+
+
+First test: connected Supabase Postegre SQL to Database Pilot through https://workspaceapi-server-production-811c.up.railway.app/. Obtained token, MCP URL, and instructions to connect to agent.
+
+I connected it to Replit, and it proved successful, giving me information about the public database tables and content for another project of mine.
+
+This was my first try at an MCP server, and I developed it in about 3-3.5 hours with Replit free.
+
+Here's what the AI wrote for the README for more details about the project:
 
 
 
