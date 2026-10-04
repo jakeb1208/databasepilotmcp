@@ -25,30 +25,27 @@ if (!Number.isInteger(queryTimeout) || queryTimeout < 1_000 || queryTimeout > 12
   throw new Error("DATABASE_QUERY_TIMEOUT_MS must be an integer from 1000 to 120000.");
 }
 
-function getDatabaseKind(rawUrl: string): DatabaseKind {
-  const requested = process.env["DATABASE_TYPE"]?.toLowerCase();
-  if (requested) {
-    if (["postgres", "postgresql", "cockroach", "cockroachdb"].includes(requested)) {
-      return "postgres";
-    }
-    if (["mysql", "mariadb"].includes(requested)) return "mysql";
-    if (["sqlite", "sqlite3"].includes(requested)) return "sqlite";
-    if (["mssql", "sqlserver", "sql-server"].includes(requested)) return "sqlserver";
-    throw new Error(
-      "DATABASE_TYPE must be postgres, mysql, sqlite, or sqlserver.",
-    );
+function getDatabaseKind(rawUrl: string, requested?: DatabaseKind): DatabaseKind {
+  const protocol = rawUrl.match(/^([a-z][a-z0-9+.-]*):/i)?.[1]?.toLowerCase();
+  let detected: DatabaseKind | undefined;
+  if (protocol && ["postgres", "postgresql", "cockroach", "cockroachdb"].includes(protocol)) {
+    detected = "postgres";
+  } else if (protocol && ["mysql", "mariadb"].includes(protocol)) {
+    detected = "mysql";
+  } else if (protocol && ["sqlite", "file"].includes(protocol)) {
+    detected = "sqlite";
+  } else if (protocol && ["mssql", "sqlserver"].includes(protocol)) {
+    detected = "sqlserver";
   }
 
-  const protocol = rawUrl.slice(0, rawUrl.indexOf(":")).toLowerCase();
-  if (["postgres", "postgresql", "cockroach", "cockroachdb"].includes(protocol)) {
-    return "postgres";
+  if (requested) {
+    if (detected && detected !== requested) {
+      throw new Error("The database type does not match the connection string.");
+    }
+    return requested;
   }
-  if (["mysql", "mariadb"].includes(protocol)) return "mysql";
-  if (["sqlite", "file"].includes(protocol)) return "sqlite";
-  if (["mssql", "sqlserver"].includes(protocol)) return "sqlserver";
-  throw new Error(
-    "Could not determine the database type. Set DATABASE_TYPE to postgres, mysql, sqlite, or sqlserver.",
-  );
+  if (detected) return detected;
+  throw new Error("Could not determine the database type from the connection string.");
 }
 
 function getSqlitePath(rawUrl: string): string {
@@ -303,7 +300,7 @@ async function createMysqlAdapter(connectionString: string): Promise<DatabaseAda
 
 function createSqliteAdapter(connectionString: string): DatabaseAdapter {
   const path = getSqlitePath(connectionString);
-  if (!path) throw new Error("DATABASE_URL must include a SQLite file path.");
+  if (!path) throw new Error("The SQLite connection must include a database file path.");
   const database = new DatabaseSync(path, { readOnly: true });
 
   const getSchema = async (): Promise<TableSchema[]> => {
@@ -491,15 +488,11 @@ async function createSqlServerAdapter(connectionString: string): Promise<Databas
   };
 }
 
-export async function createDatabaseAdapter(): Promise<DatabaseAdapter> {
-  const connectionString = process.env["DATABASE_URL"];
-  if (!connectionString) {
-    throw new Error(
-      "Database not configured. Add DATABASE_URL in Replit Secrets and, if needed, set DATABASE_TYPE.",
-    );
-  }
-
-  const kind = getDatabaseKind(connectionString);
+export async function createDatabaseAdapter(
+  requestedKind: DatabaseKind,
+  connectionString: string,
+): Promise<DatabaseAdapter> {
+  const kind = getDatabaseKind(connectionString, requestedKind);
   switch (kind) {
     case "postgres":
       return createPostgresAdapter(connectionString);
@@ -509,28 +502,6 @@ export async function createDatabaseAdapter(): Promise<DatabaseAdapter> {
       return createSqliteAdapter(connectionString);
     case "sqlserver":
       return createSqlServerAdapter(connectionString);
-  }
-}
-
-let adapterPromise: Promise<DatabaseAdapter> | undefined;
-
-export async function getDatabaseAdapter(): Promise<DatabaseAdapter> {
-  if (!adapterPromise) {
-    adapterPromise = createDatabaseAdapter().catch((error: unknown) => {
-      adapterPromise = undefined;
-      throw error;
-    });
-  }
-  return adapterPromise;
-}
-
-export function getConfiguredDatabaseKind(): DatabaseKind | null {
-  const url = process.env["DATABASE_URL"];
-  if (!url) return null;
-  try {
-    return getDatabaseKind(url);
-  } catch {
-    return null;
   }
 }
 

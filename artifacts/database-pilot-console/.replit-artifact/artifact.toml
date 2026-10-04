@@ -1,0 +1,28 @@
+kind = "web"
+previewPath = "/"
+title = "Database Pilot"
+description = "A secure setup console for Database Pilot. Database owners create an account, connect and test any supported relational database, save encrypted connection settings, and create revocable MCP access tokens for AI clients."
+version = "1.0.0"
+id = "artifacts/database-pilot-console"
+router = "path"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 25764
+
+[services.development]
+run = "pnpm --filter @workspace/database-pilot-console run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/database-pilot-console", "run", "build" ]
+serve = "static"
+publicDir = "artifacts/database-pilot-console/dist/public"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "25764"
+BASE_PATH = "/"

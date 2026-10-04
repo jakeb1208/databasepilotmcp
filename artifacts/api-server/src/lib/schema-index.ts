@@ -1,5 +1,5 @@
-import { formatSchema, formatSchemaName, getDatabaseAdapter } from "./database/drivers";
-import type { ColumnSchema, TableSchema } from "./database/types";
+import { formatSchema, formatSchemaName } from "./database/drivers";
+import type { ColumnSchema, DatabaseAdapter, TableSchema } from "./database/types";
 
 interface IndexedTable {
   table: TableSchema;
@@ -12,6 +12,12 @@ interface SchemaIndex {
   tables: IndexedTable[];
 }
 
+interface SchemaIndexCache {
+  builtIndex?: SchemaIndex;
+  buildInFlight?: Promise<SchemaIndex>;
+  lastUsedAt: number;
+}
+
 export interface SchemaMatch {
   name: string;
   score: number;
@@ -19,8 +25,7 @@ export interface SchemaMatch {
 }
 
 const indexTtlMs = 5 * 60 * 1_000;
-let cachedIndex: SchemaIndex | undefined;
-let buildInFlight: Promise<SchemaIndex> | undefined;
+const indexesByConnection = new Map<string, SchemaIndexCache>();
 
 const conceptGroups = [
   ["customer", "client", "buyer", "account", "patron"],
@@ -153,8 +158,7 @@ function selectRelevantColumns(
     .map(({ column }) => column);
 }
 
-async function buildIndex(): Promise<SchemaIndex> {
-  const database = await getDatabaseAdapter();
+async function buildIndex(database: DatabaseAdapter): Promise<SchemaIndex> {
   const tables = await database.getSchema();
   const texts = tables.map((table) => documentText(table));
   const documentFrequency = new Map<string, number>();
@@ -174,29 +178,56 @@ async function buildIndex(): Promise<SchemaIndex> {
   };
 }
 
-async function getIndex(forceRefresh = false): Promise<SchemaIndex> {
-  if (!forceRefresh && cachedIndex && Date.now() - cachedIndex.builtAt < indexTtlMs) {
-    return cachedIndex;
+function getCache(cacheKey: string): SchemaIndexCache {
+  let entry = indexesByConnection.get(cacheKey);
+  if (!entry) {
+    entry = { lastUsedAt: Date.now() };
+    indexesByConnection.set(cacheKey, entry);
   }
-  if (buildInFlight) return buildInFlight;
+  entry.lastUsedAt = Date.now();
+  if (indexesByConnection.size > 100) {
+    const oldest = [...indexesByConnection.entries()]
+      .filter(([key]) => key !== cacheKey)
+      .sort((a, b) => a[1].lastUsedAt - b[1].lastUsedAt)[0];
+    if (oldest) indexesByConnection.delete(oldest[0]);
+  }
+  return entry;
+}
 
-  buildInFlight = buildIndex()
+async function getIndex(
+  cacheKey: string,
+  database: DatabaseAdapter,
+  forceRefresh = false,
+): Promise<SchemaIndex> {
+  const entry = getCache(cacheKey);
+  if (
+    !forceRefresh &&
+    entry.builtIndex &&
+    Date.now() - entry.builtIndex.builtAt < indexTtlMs
+  ) {
+    return entry.builtIndex;
+  }
+  if (entry.buildInFlight) return entry.buildInFlight;
+
+  entry.buildInFlight = buildIndex(database)
     .then((index) => {
-      cachedIndex = index;
+      entry.builtIndex = index;
       return index;
     })
     .finally(() => {
-      buildInFlight = undefined;
+      entry.buildInFlight = undefined;
     });
-  return buildInFlight;
+  return entry.buildInFlight;
 }
 
 export async function searchSchema(
+  cacheKey: string,
+  database: DatabaseAdapter,
   question: string,
   limit = 5,
 ): Promise<{ matches: SchemaMatch[]; tableCount: number; indexBuiltAt: string }> {
   const queryVector = buildVector(question, new Map(), 1);
-  const index = await getIndex();
+  const index = await getIndex(cacheKey, database);
   const matches = index.tables
     .map((document) => {
       const selectedColumns = selectRelevantColumns(document.table, question);
@@ -222,27 +253,146 @@ export async function searchSchema(
   };
 }
 
-export async function refreshSchemaIndex(): Promise<{
+export async function refreshSchemaIndex(
+  cacheKey: string,
+  database: DatabaseAdapter,
+): Promise<{
   tableCount: number;
   indexBuiltAt: string;
 }> {
-  const index = await getIndex(true);
+  const index = await getIndex(cacheKey, database, true);
   return {
     tableCount: index.tables.length,
     indexBuiltAt: new Date(index.builtAt).toISOString(),
   };
 }
 
-export async function getAllTables(): Promise<TableSchema[]> {
-  const index = await getIndex();
+export async function getAllTables(
+  cacheKey: string,
+  database: DatabaseAdapter,
+): Promise<TableSchema[]> {
+  const index = await getIndex(cacheKey, database);
   return index.tables.map(({ table }) => table);
 }
 
-export async function getTableSchema(name: string): Promise<SchemaMatch | null> {
-  const index = await getIndex();
+export async function getTableSchema(
+  cacheKey: string,
+  database: DatabaseAdapter,
+  name: string,
+): Promise<SchemaMatch | null> {
+  const index = await getIndex(cacheKey, database);
   const found = index.tables.find(
     ({ table }) => formatSchemaName(table).toLowerCase() === name.toLowerCase(),
   );
   if (!found) return null;
   return { name: formatSchemaName(found.table), score: 1, schema: formatSchema(found.table) };
+}
+
+function resolveTableName(
+  tables: TableSchema[],
+  input: string,
+): { table?: TableSchema; matches: string[] } {
+  const normalized = input.toLowerCase();
+  const exact = tables.find(
+    (table) => formatSchemaName(table).toLowerCase() === normalized,
+  );
+  if (exact) return { table: exact, matches: [formatSchemaName(exact)] };
+  const unqualified = tables.filter((table) => table.name.toLowerCase() === normalized);
+  if (unqualified.length === 1) {
+    return { table: unqualified[0], matches: [formatSchemaName(unqualified[0]!)] };
+  }
+  return {
+    matches: unqualified.map(formatSchemaName),
+  };
+}
+
+export async function findRelationshipPath(
+  cacheKey: string,
+  database: DatabaseAdapter,
+  fromName: string,
+  toName: string,
+  maxDepth: number,
+): Promise<{
+  found: boolean;
+  fromTable: string;
+  toTable: string;
+  relationships: { fromTable: string; fromColumn: string; toTable: string; toColumn: string }[];
+  matchingTables?: string[];
+}> {
+  const tables = await getAllTables(cacheKey, database);
+  const from = resolveTableName(tables, fromName);
+  const to = resolveTableName(tables, toName);
+  if (!from.table || !to.table) {
+    return {
+      found: false,
+      fromTable: fromName,
+      toTable: toName,
+      relationships: [],
+      matchingTables: [...new Set([...from.matches, ...to.matches])],
+    };
+  }
+  const fromKey = formatSchemaName(from.table);
+  const toKey = formatSchemaName(to.table);
+  if (fromKey === toKey) {
+    return { found: true, fromTable: fromKey, toTable: toKey, relationships: [] };
+  }
+
+  const adjacency = new Map<
+    string,
+    { fromTable: string; fromColumn: string; toTable: string; toColumn: string }[]
+  >();
+  const addEdge = (
+    edge: { fromTable: string; fromColumn: string; toTable: string; toColumn: string },
+  ): void => {
+    const edges = adjacency.get(edge.fromTable) ?? [];
+    edges.push(edge);
+    adjacency.set(edge.fromTable, edges);
+  };
+
+  for (const table of tables) {
+    const tableName = formatSchemaName(table);
+    for (const column of table.columns) {
+      if (!column.foreignKey) continue;
+      const reference = resolveTableName(tables, column.foreignKey.table);
+      if (!reference.table) continue;
+      const referencedName = formatSchemaName(reference.table);
+      addEdge({
+        fromTable: tableName,
+        fromColumn: column.name,
+        toTable: referencedName,
+        toColumn: column.foreignKey.column,
+      });
+      addEdge({
+        fromTable: referencedName,
+        fromColumn: column.foreignKey.column,
+        toTable: tableName,
+        toColumn: column.name,
+      });
+    }
+  }
+
+  const queue: {
+    table: string;
+    path: { fromTable: string; fromColumn: string; toTable: string; toColumn: string }[];
+  }[] = [{ table: fromKey, path: [] }];
+  const visited = new Set([fromKey]);
+  while (queue.length > 0) {
+    const current = queue.shift()!;
+    if (current.path.length >= maxDepth) continue;
+    for (const edge of adjacency.get(current.table) ?? []) {
+      if (visited.has(edge.toTable)) continue;
+      const path = [...current.path, edge];
+      if (edge.toTable === toKey) {
+        return {
+          found: true,
+          fromTable: fromKey,
+          toTable: toKey,
+          relationships: path,
+        };
+      }
+      visited.add(edge.toTable);
+      queue.push({ table: edge.toTable, path });
+    }
+  }
+  return { found: false, fromTable: fromKey, toTable: toKey, relationships: [] };
 }

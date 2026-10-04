@@ -2,13 +2,13 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import {
   formatSchemaName,
-  getDatabaseAdapter,
   summarizeSchema,
   validateMaxRows,
   validateQueryParameters,
 } from "./database/drivers";
-import type { QueryResult, QueryValue } from "./database/types";
+import type { DatabaseAdapter, QueryResult, QueryValue } from "./database/types";
 import {
+  findRelationshipPath,
   getAllTables,
   getTableSchema,
   refreshSchemaIndex,
@@ -72,7 +72,18 @@ function capQueryResult(result: QueryResult): QueryResult {
   };
 }
 
-export function createDatabasePilotServer(): McpServer {
+export interface DatabasePilotContext {
+  connectionId: string;
+  getAdapter: () => Promise<DatabaseAdapter>;
+}
+
+function quoteIdentifier(kind: DatabaseAdapter["kind"], identifier: string): string {
+  if (kind === "mysql") return `\`${identifier.replaceAll("`", "``")}\``;
+  if (kind === "sqlserver") return `[${identifier.replaceAll("]", "]]")}]`;
+  return `"${identifier.replaceAll('"', '""')}"`;
+}
+
+export function createDatabasePilotServer(context: DatabasePilotContext): McpServer {
   const server = new McpServer({
     name: "database-pilot",
     version: "1.0.0",
@@ -98,7 +109,13 @@ export function createDatabasePilotServer(): McpServer {
     },
     async ({ question, tableLimit }) => {
       try {
-        const result = await searchSchema(question, tableLimit ?? 5);
+        const database = await context.getAdapter();
+        const result = await searchSchema(
+          context.connectionId,
+          database,
+          question,
+          tableLimit ?? 5,
+        );
         return jsonToolResult({
           question,
           matchingTables: result.matches,
@@ -107,6 +124,46 @@ export function createDatabasePilotServer(): McpServer {
           indexBuiltAt: result.indexBuiltAt,
           nextStep:
             "Use the matching schemas to write one parameterized SELECT query, call run_readonly_query, and answer the user's question from the returned rows. If no schema matches, inspect database_overview or describe_table.",
+        });
+      } catch (error) {
+        return errorToolResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "list_tables",
+    {
+      title: "List database tables",
+      description:
+        "Lists table names and column counts, optionally filtered by schema or name. Use this for direct inventory questions before describing a specific table.",
+      inputSchema: {
+        schema: z.string().min(1).max(128).optional(),
+        nameContains: z.string().min(1).max(128).optional(),
+        limit: z.number().int().min(1).max(100).optional(),
+      },
+      annotations: readOnlyAnnotations,
+    },
+    async ({ schema, nameContains, limit }) => {
+      try {
+        const database = await context.getAdapter();
+        const tables = await getAllTables(context.connectionId, database);
+        const filtered = tables.filter(
+          (table) =>
+            (!schema || table.schema.toLowerCase() === schema.toLowerCase()) &&
+            (!nameContains ||
+              table.name.toLowerCase().includes(nameContains.toLowerCase())),
+        );
+        const maximum = limit ?? 100;
+        return jsonToolResult({
+          tableCount: filtered.length,
+          tables: filtered.slice(0, maximum).map((table) => ({
+            name: formatSchemaName(table),
+            schema: table.schema,
+            table: table.name,
+            columnCount: table.columns.length,
+          })),
+          truncated: filtered.length > maximum,
         });
       } catch (error) {
         return errorToolResult(error);
@@ -125,8 +182,8 @@ export function createDatabasePilotServer(): McpServer {
     },
     async () => {
       try {
-        const database = await getDatabaseAdapter();
-        const tables = await getAllTables();
+        const database = await context.getAdapter();
+        const tables = await getAllTables(context.connectionId, database);
         return jsonToolResult(summarizeSchema(database.kind, tables));
       } catch (error) {
         return errorToolResult(error);
@@ -148,7 +205,10 @@ export function createDatabasePilotServer(): McpServer {
     },
     async ({ query, limit }) => {
       try {
-        return jsonToolResult(await searchSchema(query, limit ?? 5));
+        const database = await context.getAdapter();
+        return jsonToolResult(
+          await searchSchema(context.connectionId, database, query, limit ?? 5),
+        );
       } catch (error) {
         return errorToolResult(error);
       }
@@ -168,12 +228,17 @@ export function createDatabasePilotServer(): McpServer {
     },
     async ({ table }) => {
       try {
-        const result = await getTableSchema(table);
+        const database = await context.getAdapter();
+        const result = await getTableSchema(context.connectionId, database, table);
         if (result) return jsonToolResult(result);
-        const allTables = await getAllTables();
+        const allTables = await getAllTables(context.connectionId, database);
         const matches = allTables.filter((candidate) => candidate.name === table);
         if (matches.length === 1) {
-          const match = await getTableSchema(formatSchemaName(matches[0]!));
+          const match = await getTableSchema(
+            context.connectionId,
+            database,
+            formatSchemaName(matches[0]!),
+          );
           if (match) return jsonToolResult(match);
         }
         if (matches.length > 1) {
@@ -184,6 +249,95 @@ export function createDatabasePilotServer(): McpServer {
         }
         return jsonToolResult({
           error: `Table "${table}" was not found in the current schema index.`,
+        });
+      } catch (error) {
+        return errorToolResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "find_table_relationships",
+    {
+      title: "Find a relationship path between tables",
+      description:
+        "Finds the shortest path of declared foreign keys between two tables. Use it when an agent needs to determine how to join related tables.",
+      inputSchema: {
+        fromTable: z.string().min(1).max(256),
+        toTable: z.string().min(1).max(256),
+        maxDepth: z.number().int().min(1).max(6).optional(),
+      },
+      annotations: readOnlyAnnotations,
+    },
+    async ({ fromTable, toTable, maxDepth }) => {
+      try {
+        const database = await context.getAdapter();
+        return jsonToolResult(
+          await findRelationshipPath(
+            context.connectionId,
+            database,
+            fromTable,
+            toTable,
+            maxDepth ?? 4,
+          ),
+        );
+      } catch (error) {
+        return errorToolResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "sample_table_rows",
+    {
+      title: "Sample rows from a table",
+      description:
+        "Returns a small, bounded sample from one table to help identify real value formats. This returns database data to the connected MCP client; use only for tables the user asked about. The database connection itself must use read-only permissions.",
+      inputSchema: {
+        table: z.string().min(1).max(256),
+        maxRows: z.number().int().min(1).max(20).optional(),
+      },
+      annotations: readOnlyAnnotations,
+    },
+    async ({ table, maxRows }) => {
+      try {
+        const database = await context.getAdapter();
+        const tables = await getAllTables(context.connectionId, database);
+        const qualified = tables.filter(
+          (candidate) =>
+            formatSchemaName(candidate).toLowerCase() === table.toLowerCase(),
+        );
+        const unqualified = tables.filter(
+          (candidate) => candidate.name.toLowerCase() === table.toLowerCase(),
+        );
+        const matches = qualified.length > 0 ? qualified : unqualified;
+        if (matches.length !== 1) {
+          return jsonToolResult({
+            error:
+              matches.length > 1
+                ? "This table name exists in more than one schema."
+                : `Table "${table}" was not found in the current schema index.`,
+            matchingTables: matches.map(formatSchemaName),
+          });
+        }
+        const selected = matches[0]!;
+        const tableName = [selected.schema, selected.name]
+          .map((identifier) => quoteIdentifier(database.kind, identifier))
+          .join(".");
+        const limit = maxRows ?? 5;
+        const result = await database.query(
+          `SELECT * FROM ${tableName}`,
+          [],
+          validateMaxRows(limit),
+        );
+        const bounded = capQueryResult(result);
+        return jsonToolResult({
+          table: formatSchemaName(selected),
+          databaseType: database.kind,
+          ...bounded,
+          ...(bounded.truncated
+            ? { note: "The sample was capped. Request only the columns and rows needed." }
+            : {}),
         });
       } catch (error) {
         return errorToolResult(error);
@@ -206,7 +360,7 @@ export function createDatabasePilotServer(): McpServer {
     },
     async ({ sql: query, parameters, maxRows }) => {
       try {
-        const database = await getDatabaseAdapter();
+        const database = await context.getAdapter();
         const validatedParameters = validateQueryParameters(
           (parameters ?? []) as QueryValue[],
         );
@@ -243,7 +397,10 @@ export function createDatabasePilotServer(): McpServer {
     },
     async () => {
       try {
-        return jsonToolResult(await refreshSchemaIndex());
+        const database = await context.getAdapter();
+        return jsonToolResult(
+          await refreshSchemaIndex(context.connectionId, database),
+        );
       } catch (error) {
         return errorToolResult(error);
       }

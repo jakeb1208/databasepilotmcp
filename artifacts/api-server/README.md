@@ -1,74 +1,104 @@
-# Database Pilot MCP
+# Database Pilot
 
-Database Pilot is a server-side Model Context Protocol (MCP) service for AI
-agents. An agent starts with a natural-language question, retrieves only the
-matching table definitions, runs a bounded read-only query, and answers from
-the returned rows.
+Database Pilot is a multi-user, read-only MCP service. Each account saves its
+own database connections and creates bearer tokens scoped to one connection.
+The web console is served at `/`; the stateless Streamable HTTP MCP endpoint is
+`/api/mcp`.
 
-Schema retrieval uses a local in-memory TF-IDF index with lightweight concept
-expansion. It needs no paid embedding API or hosted vector database. The MCP
-server does not include an LLM: the agent that connects to it uses its existing
-model to turn the question and retrieved schema into a query.
+Schema search uses a local in-memory TF-IDF index; the MCP service does not
+send schema or query data to an AI service. The connected MCP client uses its
+own model to choose tools and interpret results.
 
-## MCP endpoint
+## Railway setup
 
-The Streamable HTTP endpoint is:
-
-```text
-/api/mcp
-```
-
-The service is stateless over HTTP. MCP clients send
-`Authorization: Bearer <MCP_AUTH_TOKEN>` on each request.
-
-## Configure a database
-
-Set these through Replit Secrets or the environment used to run the service.
-Never put database credentials in source code or chat.
+Provision a Railway PostgreSQL service for Database Pilot's account, session,
+connection-metadata, and token records. This database is separate from every
+customer database entered in the console. Set the following as Railway service
+variables:
 
 | Variable | Required | Description |
 | --- | --- | --- |
-| `DATABASE_URL` | Yes | Driver connection URL or SQLite file path. Store URLs containing credentials as a secret. |
-| `DATABASE_TYPE` | No | `postgres`, `mysql`, `sqlite`, or `sqlserver`. Usually inferred from the URL scheme. CockroachDB uses the PostgreSQL driver. |
-| `MCP_AUTH_TOKEN` | Yes | A private bearer token of at least 32 characters protecting the MCP endpoint. |
-| `MCP_ALLOWED_ORIGINS` | No | Comma-separated browser origins allowed to call MCP. Server-to-server requests without an `Origin` header are accepted. By default, browser requests must be same-origin. |
-| `DATABASE_QUERY_TIMEOUT_MS` | No | Query timeout in milliseconds for supported drivers; defaults to 10,000. |
+| `AUTH_DATABASE_URL` | Yes | Railway PostgreSQL connection URL used only for Database Pilot accounts, sessions, encrypted connection records, and token hashes. |
+| `DB_CREDENTIALS_ENCRYPTION_KEY` | Yes | Base64 encoding of exactly 32 random bytes used for AES-256-GCM encryption of saved customer connection strings. Generate with `openssl rand -base64 32`; keep a durable backup because losing it makes saved connections unrecoverable. |
+| `SQLITE_DATABASE_ROOT` | For SQLite | Directory on a Railway volume containing SQLite files. SQLite paths are restricted to existing files inside this directory; the browser does not upload files. |
+| `MCP_ALLOWED_ORIGINS` | No | Comma-separated additional browser origins permitted to send MCP requests. Same-origin requests are allowed by default; server-to-server requests without an `Origin` header are accepted. |
+| `DATABASE_QUERY_TIMEOUT_MS` | No | Query timeout in milliseconds; defaults to 10,000. |
 
-Supported database URL schemes:
+The API creates its prefixed account tables and indexes with additive
+`CREATE TABLE/INDEX IF NOT EXISTS` statements when the Railway database is
+first used. Existing customer databases are never migrated or replaced.
 
-- PostgreSQL: `postgres://` or `postgresql://`
-- CockroachDB: `cockroach://` or `cockroachdb://`, or set `DATABASE_TYPE=postgres`
-- MySQL: `mysql://`
-- MariaDB: `mariadb://`
-- SQLite: `sqlite:./path/to/database.sqlite`, `sqlite:///absolute/path/to/database.sqlite`, or `file:./path/to/database.sqlite`
-- SQL Server: `mssql://` or `sqlserver://`; alternatively set `DATABASE_TYPE=sqlserver` and provide a SQL Server connection string
+Do not set a shared `DATABASE_URL` or `MCP_AUTH_TOKEN` for customer access.
+Each user enters their own connection in the console, which tests it before
+saving the encrypted credentials. The service stores only a hash of each MCP
+token and returns the plaintext token once at creation.
 
-SQLite opens an existing database file in read-only mode. It does not create a
-missing database file.
+## Accounts and connections
+
+Accounts use email and a password of at least 12 characters. Passwords are
+hashed with scrypt; browser sessions are opaque, stored as hashes, and expire
+after 14 days. Email verification and password recovery are not configured in
+this version.
+
+Connection types:
+
+- PostgreSQL and CockroachDB (PostgreSQL driver)
+- MySQL and MariaDB (MySQL driver)
+- SQLite (existing file under `SQLITE_DATABASE_ROOT`, opened read-only)
+- SQL Server (URL or connection string)
+
+Customer databases must be reachable from the Railway service. Use dedicated
+database credentials with only the read permissions required, and restrict
+database network access to trusted egress where possible. A hosted connection
+service is a database proxy: do not enter a connection that you are not
+authorized to expose to the MCP client.
 
 ## Agent tools
 
-- `ask_database` — retrieves the most relevant schema for a natural-language question and tells the agent to query and answer from the results.
-- `database_overview` — returns the engine, schema names, and up to 50 table names.
-- `search_schema` — searches the local schema index.
-- `describe_table` — returns one table's columns and key relationships.
-- `run_readonly_query` — runs one bounded `SELECT` or read-only CTE, with a maximum of 200 returned rows.
-- `refresh_schema_index` — refreshes metadata after schema changes.
+- `ask_database` — retrieve the most relevant schema for a natural-language question.
+- `database_overview` — return database engine, schema names, and sample table names.
+- `list_tables` — list tables with optional schema/name filtering.
+- `search_schema` — retrieve table schemas matching a business concept or field.
+- `describe_table` — return columns and key relationships for one table.
+- `find_table_relationships` — find a shortest declared foreign-key path between tables.
+- `sample_table_rows` — return a bounded sample of up to 20 rows from one table.
+- `run_readonly_query` — run one bounded `SELECT` or read-only CTE, up to 200 rows.
+- `refresh_schema_index` — refresh cached metadata after schema changes.
 
-The query tool rejects writes, multiple statements, locking reads, and selected
-side-effect functions. It also uses read-only transactions or a read-only
-SQLite connection where supported. Use a database login that has only the
-minimum read permissions required; SQL Server credentials in particular must
-be read-only because SQL Server does not offer the same per-transaction
-read-only enforcement.
+Read-only query validation rejects writes, multiple statements, locking reads,
+and selected side-effect functions. PostgreSQL, MySQL, and SQLite use
+read-only transactions or files where supported. SQL Server connections must
+use a read-only database account because SQL Server does not provide the same
+per-transaction read-only enforcement. `sample_table_rows` returns actual
+database values to the connected MCP client; use it only when the user asks
+for examples.
 
-For PostgreSQL, use `$1`, `$2`, ... placeholders. For MySQL, SQLite, and SQL
-Server, use `?` placeholders. Pass the matching values in `parameters`.
+For PostgreSQL use `$1`, `$2`, ... placeholders. For MySQL, SQLite, and SQL
+Server use `?` placeholders. Pass values through the tool's `parameters`.
 
-## Run and check
+## Connect an MCP client
+
+Create a token in the console and configure a client that supports custom
+bearer headers with:
+
+```text
+URL: https://<your-railway-domain>/api/mcp
+Authorization: Bearer <token-shown-once>
+```
+
+Some MCP clients require OAuth discovery and will not accept a custom bearer
+token. OAuth authorization is not implemented in this version.
+
+## Run locally
+
+The web preview is at `/` and the API preview is at `/api`. Account and
+connection operations require `AUTH_DATABASE_URL` and
+`DB_CREDENTIALS_ENCRYPTION_KEY`; no database connection values are required at
+build time.
 
 ```sh
+pnpm --filter @workspace/database-pilot-console run dev
 pnpm --filter @workspace/api-server run dev
 ```
 
-The health check is `/api/healthz`. The MCP endpoint is `/api/mcp`.
+Health check: `/api/healthz`.

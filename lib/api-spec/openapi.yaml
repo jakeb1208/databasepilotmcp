@@ -3,13 +3,21 @@ info:
   # Do not change the title, if the title changes, the import paths will be broken
   title: Api
   version: 0.1.0
-  description: API specification
+  description: Database Pilot account, connection, and MCP token API
 servers:
   - url: /api
     description: Base API path
 tags:
   - name: health
     description: Health operations
+  - name: auth
+    description: Account and session operations
+  - name: dashboard
+    description: Account overview
+  - name: connections
+    description: Per-user database connections
+  - name: tokens
+    description: Per-connection MCP bearer tokens
 paths:
   /healthz:
     get:
@@ -24,7 +32,335 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthStatus"
+  /auth/register:
+    post:
+      operationId: registerAccount
+      tags: [auth]
+      summary: Create an account
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RegisterInput"
+      responses:
+        "201":
+          description: Account created and signed in
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionResponse"
+        "400":
+          description: Invalid account details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
+          description: Email is already registered
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: Authentication storage is not configured
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /auth/login:
+    post:
+      operationId: loginAccount
+      tags: [auth]
+      summary: Sign in to an account
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LoginInput"
+      responses:
+        "200":
+          description: Signed in
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionResponse"
+        "400":
+          description: Invalid account details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: Email or password is incorrect
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: Authentication storage is not configured
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /auth/logout:
+    post:
+      operationId: logoutAccount
+      tags: [auth]
+      summary: Sign out of the current session
+      security:
+        - sessionCookie: []
+      responses:
+        "204":
+          description: Signed out
+  /auth/session:
+    get:
+      operationId: getSession
+      tags: [auth]
+      summary: Get the current session
+      responses:
+        "200":
+          description: Session state
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionResponse"
+        "503":
+          description: Authentication storage is not configured
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /dashboard:
+    get:
+      operationId: getDashboardSummary
+      tags: [dashboard]
+      summary: Get the account overview
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Counts and recent account activity
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DashboardSummary"
+        "401":
+          description: Sign in required
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /connections:
+    get:
+      operationId: listConnections
+      tags: [connections]
+      summary: List the current user's database connections
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Saved connection metadata
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/DatabaseConnection"
+        "401":
+          description: Sign in required
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+    post:
+      operationId: createConnection
+      tags: [connections]
+      summary: Test and securely save a database connection
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ConnectionInput"
+      responses:
+        "201":
+          description: Connection tested and saved
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DatabaseConnection"
+        "400":
+          description: Invalid connection details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "422":
+          description: The database could not be reached
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: Connection encryption is not configured
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /connections/test:
+    post:
+      operationId: testConnection
+      tags: [connections]
+      summary: Test database details without saving them
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ConnectionTestInput"
+      responses:
+        "200":
+          description: Connection test result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConnectionTestResult"
+        "400":
+          description: Invalid connection details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "422":
+          description: The database could not be reached
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /connections/{connectionId}:
+    delete:
+      operationId: deleteConnection
+      tags: [connections]
+      summary: Delete a saved connection and revoke its tokens
+      security:
+        - sessionCookie: []
+      parameters:
+        - name: connectionId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "204":
+          description: Connection deleted
+        "401":
+          description: Sign in required
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Connection not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /tokens:
+    get:
+      operationId: listTokens
+      tags: [tokens]
+      summary: List MCP tokens without revealing their values
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Token metadata
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ApiToken"
+        "401":
+          description: Sign in required
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+    post:
+      operationId: createToken
+      tags: [tokens]
+      summary: Create a bearer token for one saved database connection
+      description: The plaintext token is returned once and cannot be retrieved later.
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TokenInput"
+      responses:
+        "201":
+          description: Token created; plaintext is shown only in this response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TokenCreated"
+        "400":
+          description: Invalid token details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Connection not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /tokens/{tokenId}:
+    delete:
+      operationId: revokeToken
+      tags: [tokens]
+      summary: Revoke an MCP token
+      security:
+        - sessionCookie: []
+      parameters:
+        - name: tokenId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "204":
+          description: Token revoked
+        "401":
+          description: Sign in required
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Token not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
 components:
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: database_pilot_session
   schemas:
     HealthStatus:
       type: object
@@ -33,3 +369,184 @@ components:
           type: string
       required:
         - status
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+      required: [error]
+    DatabaseType:
+      type: string
+      enum: [postgres, mysql, sqlite, sqlserver]
+    AccountUser:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        email:
+          type: string
+          format: email
+        createdAt:
+          type: string
+          format: date-time
+      required: [id, email, createdAt]
+    SessionResponse:
+      type: object
+      properties:
+        authenticated:
+          type: boolean
+        user:
+          oneOf:
+            - $ref: "#/components/schemas/AccountUser"
+            - type: "null"
+      required: [authenticated, user]
+    RegisterInput:
+      type: object
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 254
+        password:
+          type: string
+          minLength: 12
+          maxLength: 256
+      required: [email, password]
+    LoginInput:
+      type: object
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 254
+        password:
+          type: string
+          minLength: 1
+          maxLength: 256
+      required: [email, password]
+    DatabaseConnection:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        databaseType:
+          $ref: "#/components/schemas/DatabaseType"
+        createdAt:
+          type: string
+          format: date-time
+        lastTestedAt:
+          type: ["string", "null"]
+          format: date-time
+      required: [id, name, databaseType, createdAt, lastTestedAt]
+    ConnectionInput:
+      type: object
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 80
+        databaseType:
+          $ref: "#/components/schemas/DatabaseType"
+        connectionString:
+          type: string
+          minLength: 5
+          maxLength: 4096
+      required: [name, databaseType, connectionString]
+    ConnectionTestInput:
+      type: object
+      properties:
+        databaseType:
+          $ref: "#/components/schemas/DatabaseType"
+        connectionString:
+          type: string
+          minLength: 5
+          maxLength: 4096
+      required: [databaseType, connectionString]
+    ConnectionTestResult:
+      type: object
+      properties:
+        success:
+          type: boolean
+        databaseType:
+          $ref: "#/components/schemas/DatabaseType"
+        schemaCount:
+          type: integer
+          minimum: 0
+        tableCount:
+          type: integer
+          minimum: 0
+        message:
+          type: string
+      required: [success, databaseType, schemaCount, tableCount, message]
+    ApiToken:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        connectionId:
+          type: string
+          format: uuid
+        connectionName:
+          type: string
+        label:
+          type: string
+        tokenPrefix:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+        lastUsedAt:
+          type: ["string", "null"]
+          format: date-time
+        revokedAt:
+          type: ["string", "null"]
+          format: date-time
+      required: [id, connectionId, connectionName, label, tokenPrefix, createdAt, lastUsedAt, revokedAt]
+    TokenInput:
+      type: object
+      properties:
+        connectionId:
+          type: string
+          format: uuid
+        label:
+          type: string
+          minLength: 1
+          maxLength: 80
+      required: [connectionId, label]
+    TokenCreated:
+      type: object
+      properties:
+        token:
+          type: string
+          description: Plaintext bearer token; shown only once.
+        tokenInfo:
+          $ref: "#/components/schemas/ApiToken"
+      required: [token, tokenInfo]
+    DashboardSummary:
+      type: object
+      properties:
+        user:
+          $ref: "#/components/schemas/AccountUser"
+        connectionsCount:
+          type: integer
+          minimum: 0
+        activeTokensCount:
+          type: integer
+          minimum: 0
+        revokedTokensCount:
+          type: integer
+          minimum: 0
+        recentConnections:
+          type: array
+          items:
+            $ref: "#/components/schemas/DatabaseConnection"
+        recentTokens:
+          type: array
+          items:
+            $ref: "#/components/schemas/ApiToken"
+      required: [user, connectionsCount, activeTokensCount, revokedTokensCount, recentConnections, recentTokens]

@@ -1,1 +1,2 @@
 - [pnpm workspace installs](pnpm-workspace-installs.md) — scope dependency changes to a leaf package, then reconcile workspace links before typechecking.
+- [Database Pilot data ownership](database-pilot-scope.md) — preserve every customer database driver; Railway Postgres is only for Database Pilot account and auth data.
