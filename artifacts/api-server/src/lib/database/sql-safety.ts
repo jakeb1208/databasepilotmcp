@@ -2,12 +2,14 @@ const deniedWords = new Set([
   "ALTER",
   "ANALYZE",
   "ATTACH",
+  "BACKUP",
   "BEGIN",
   "CALL",
   "CLUSTER",
   "COMMIT",
   "COPY",
   "CREATE",
+  "DBCC",
   "DECLARE",
   "DELETE",
   "DETACH",
@@ -17,11 +19,15 @@ const deniedWords = new Set([
   "EXECUTE",
   "GRANT",
   "INSERT",
+  "INSTALL",
+  "KILL",
+  "LOAD",
   "INTO",
   "LOCK",
   "MERGE",
   "PRAGMA",
   "REPLACE",
+  "RESTORE",
   "RESET",
   "REVOKE",
   "ROLLBACK",
@@ -30,18 +36,30 @@ const deniedWords = new Set([
   "TRUNCATE",
   "UPDATE",
   "VACUUM",
+  "WAITFOR",
 ]);
 
 const deniedFunctions = new Set([
   "BENCHMARK",
+  "DBMS_LOCK",
+  "GET_LOCK",
+  "LOAD_EXTENSION",
   "LOAD_FILE",
+  "NEXTVAL",
   "OPENQUERY",
   "OPENROWSET",
   "OPENDATASOURCE",
+  "PG_ADVISORY_LOCK",
+  "PG_ADVISORY_UNLOCK",
+  "PG_CANCEL_BACKEND",
+  "PG_NOTIFY",
   "PG_READ_BINARY_FILE",
   "PG_READ_FILE",
   "PG_SLEEP",
+  "PG_TERMINATE_BACKEND",
+  "RELEASE_LOCK",
   "SLEEP",
+  "SETVAL",
   "XP_CMDSHELL",
 ]);
 
@@ -180,6 +198,10 @@ export function assertReadOnlyQuery(sql: string): string {
     throw new Error("This query uses a function that is not allowed.");
   }
 
+  if (/\bNEXT\s+VALUE\s+FOR\b/i.test(inspected)) {
+    throw new Error("Sequence advancement is not allowed in read-only queries.");
+  }
+
   if (/\bFOR\s+(?:NO\s+KEY\s+)?UPDATE\b|\bFOR\s+SHARE\b/i.test(inspected)) {
     throw new Error("Locking reads are not allowed.");
   }
@@ -189,31 +211,50 @@ export function assertReadOnlyQuery(sql: string): string {
 
 export function capSqlServerRows(sql: string, limit: number): string {
   const inspected = maskCommentsAndLiterals(sql);
-  const words = [...inspected.matchAll(/[A-Za-z_][A-Za-z0-9_$]*/g)];
   let depth = 0;
-  let select: RegExpMatchArray | undefined;
-  for (const word of words) {
-    if (word.index === undefined) continue;
-    while (
-      depth > 0 &&
-      inspected.slice(0, word.index).match(/\(/g)!.length >
-        inspected.slice(0, word.index).match(/\)/g)!.length
-    ) {
-      break;
+  let selectIndex = -1;
+  for (let i = 0; i < inspected.length; i += 1) {
+    if (inspected[i] === "(") {
+      depth += 1;
+      continue;
     }
-    if (inspected.slice(word.index, word.index + word[0].length).toUpperCase() === "SELECT") {
-      select = word;
+    if (inspected[i] === ")") {
+      depth = Math.max(0, depth - 1);
+      continue;
+    }
+    if (
+      depth === 0 &&
+      inspected.slice(i, i + 6).toUpperCase() === "SELECT" &&
+      !/[A-Za-z0-9_$]/.test(inspected[i - 1] ?? "") &&
+      !/[A-Za-z0-9_$]/.test(inspected[i + 6] ?? "")
+    ) {
+      selectIndex = i;
       break;
     }
   }
 
-  if (!select || select.index === undefined) return sql;
-  let insertion = select.index + select[0].length;
+  if (selectIndex < 0) return sql;
+  let insertion = selectIndex + "SELECT".length;
   const remainder = inspected.slice(insertion);
   const modifier = remainder.match(/^(\s+(?:DISTINCT|ALL)\b)/i);
   if (modifier) insertion += modifier[0].length;
 
-  if (/^\s+TOP\b/i.test(inspected.slice(insertion))) return sql;
+  const topRemainder = inspected.slice(insertion);
+  const top = topRemainder.match(/^(\s+TOP\s*)(?:\(\s*(\d+)\s*\)|(\d+))/i);
+  if (top) {
+    if (/\b(?:PERCENT|WITH\s+TIES)\b/i.test(topRemainder.slice(top[0].length))) {
+      throw new Error("TOP PERCENT and TOP WITH TIES are not supported in bounded queries.");
+    }
+    const requested = Number(top[2] ?? top[3]);
+    if (requested <= limit + 1) return sql;
+    const numberOffset = top[0].lastIndexOf(top[2] ?? top[3]);
+    const start = insertion + numberOffset;
+    const digits = top[2] ?? top[3]!;
+    return `${sql.slice(0, start)}${limit + 1}${sql.slice(start + digits.length)}`;
+  }
+  if (/^\s+TOP\b/i.test(topRemainder)) {
+    throw new Error("Use a numeric TOP clause or omit TOP; the server applies a row limit.");
+  }
   return `${sql.slice(0, insertion)} TOP (${limit + 1})${sql.slice(insertion)}`;
 }
 

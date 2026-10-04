@@ -1,5 +1,5 @@
 import { formatSchema, formatSchemaName, getDatabaseAdapter } from "./database/drivers";
-import type { TableSchema } from "./database/types";
+import type { ColumnSchema, TableSchema } from "./database/types";
 
 interface IndexedTable {
   table: TableSchema;
@@ -110,6 +110,49 @@ function documentText(table: TableSchema): string {
     .join(" ");
 }
 
+function selectRelevantColumns(
+  table: TableSchema,
+  question: string,
+  maximum = 80,
+): ColumnSchema[] {
+  if (table.columns.length <= maximum) return table.columns;
+  const queryTerms = expandTerms(tokenize(question));
+  const exactTerms = new Set(tokenize(question));
+  const ranked = table.columns.map((column, index) => {
+    const columnTerms = new Set(
+      tokenize(
+        [
+          column.name,
+          column.type,
+          column.foreignKey?.table ?? "",
+          column.foreignKey?.column ?? "",
+        ].join(" "),
+      ),
+    );
+    let score = column.primaryKey ? 0.5 : 0;
+    if (column.foreignKey) score += 0.35;
+    for (const [term, weight] of queryTerms) {
+      if (columnTerms.has(term)) score += exactTerms.has(term) ? 2 : weight;
+    }
+    return { column, index, score };
+  });
+
+  const matched = ranked
+    .filter(({ score }) => score > 0)
+    .sort((a, b) => b.score - a.score || a.index - b.index)
+    .slice(0, maximum);
+  if (matched.length < maximum) {
+    const selected = new Set(matched.map(({ index }) => index));
+    for (const item of ranked) {
+      if (matched.length >= maximum) break;
+      if (!selected.has(item.index)) matched.push(item);
+    }
+  }
+  return matched
+    .sort((a, b) => a.index - b.index)
+    .map(({ column }) => column);
+}
+
 async function buildIndex(): Promise<SchemaIndex> {
   const database = await getDatabaseAdapter();
   const tables = await database.getSchema();
@@ -150,16 +193,23 @@ async function getIndex(forceRefresh = false): Promise<SchemaIndex> {
 
 export async function searchSchema(
   question: string,
-  limit = 6,
+  limit = 5,
 ): Promise<{ matches: SchemaMatch[]; tableCount: number; indexBuiltAt: string }> {
   const queryVector = buildVector(question, new Map(), 1);
   const index = await getIndex();
   const matches = index.tables
-    .map((document) => ({
-      name: formatSchemaName(document.table),
-      score: cosineSimilarity(queryVector, document.vector),
-      schema: formatSchema(document.table),
-    }))
+    .map((document) => {
+      const selectedColumns = selectRelevantColumns(document.table, question);
+      return {
+        name: formatSchemaName(document.table),
+        score: cosineSimilarity(queryVector, document.vector),
+        schema: formatSchema(
+          document.table,
+          selectedColumns,
+          document.table.columns.length,
+        ),
+      };
+    })
     .filter((match) => match.score > 0)
     .sort((a, b) => b.score - a.score || a.name.localeCompare(b.name))
     .slice(0, limit)

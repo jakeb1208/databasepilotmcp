@@ -1,4 +1,5 @@
 import mysql from "mysql2/promise";
+import type { RowDataPacket } from "mysql2/promise";
 import sql from "mssql";
 import pg from "pg";
 import { DatabaseSync } from "node:sqlite";
@@ -20,6 +21,9 @@ import type {
 type MetadataRow = Record<string, unknown>;
 
 const queryTimeout = Number(process.env["DATABASE_QUERY_TIMEOUT_MS"] ?? 10_000);
+if (!Number.isInteger(queryTimeout) || queryTimeout < 1_000 || queryTimeout > 120_000) {
+  throw new Error("DATABASE_QUERY_TIMEOUT_MS must be an integer from 1000 to 120000.");
+}
 
 function getDatabaseKind(rawUrl: string): DatabaseKind {
   const requested = process.env["DATABASE_TYPE"]?.toLowerCase();
@@ -61,6 +65,10 @@ function normalizeRow(value: unknown): unknown {
   if (typeof value === "bigint") return value.toString();
   if (value instanceof Date) return value.toISOString();
   if (Buffer.isBuffer(value)) return `[binary data: ${value.byteLength} bytes]`;
+  if (value instanceof Uint8Array) return `[binary data: ${value.byteLength} bytes]`;
+  if (typeof value === "string" && value.length > 2_048) {
+    return `${value.slice(0, 2_048)}… [value truncated by Database Pilot]`;
+  }
   if (Array.isArray(value)) return value.map(normalizeRow);
   if (value && typeof value === "object") {
     return Object.fromEntries(
@@ -224,14 +232,14 @@ async function createMysqlAdapter(connectionString: string): Promise<DatabaseAda
 
   const getSchema = async (): Promise<TableSchema[]> => {
     const tables = new Map<string, TableSchema>();
-    const [columnRows] = await pool.query<MetadataRow[]>(
+    const [columnRows] = await pool.query<RowDataPacket[]>(
       `SELECT table_schema AS schema_name, table_name, column_name, data_type,
               is_nullable
        FROM information_schema.columns
        WHERE table_schema = DATABASE()
        ORDER BY table_schema, table_name, ordinal_position`,
     );
-    for (const row of columnRows) {
+    for (const row of columnRows as MetadataRow[]) {
       const table = getOrCreate(
         tables,
         String(row["schema_name"]),
@@ -245,7 +253,7 @@ async function createMysqlAdapter(connectionString: string): Promise<DatabaseAda
       });
     }
 
-    const [constraintRows] = await pool.query<MetadataRow[]>(
+    const [constraintRows] = await pool.query<RowDataPacket[]>(
       `SELECT table_schema AS schema_name, table_name, column_name,
               constraint_name, referenced_table_schema AS referenced_schema_name,
               referenced_table_name, referenced_column_name
@@ -253,7 +261,7 @@ async function createMysqlAdapter(connectionString: string): Promise<DatabaseAda
        WHERE table_schema = DATABASE()
          AND (constraint_name = 'PRIMARY' OR referenced_table_name IS NOT NULL)`,
     );
-    for (const row of constraintRows) {
+    for (const row of constraintRows as MetadataRow[]) {
       addConstraint(tables, row, row["constraint_name"] === "PRIMARY" ? "primary" : "foreign");
     }
     return orderSchema(tables);
@@ -268,7 +276,10 @@ async function createMysqlAdapter(connectionString: string): Promise<DatabaseAda
       try {
         await connection.query("START TRANSACTION READ ONLY");
         const [rows, fields] = await connection.execute(
-          capSubqueryRows(safeSql, maxRows),
+          {
+            sql: capSubqueryRows(safeSql, maxRows),
+            timeout: queryTimeout,
+          },
           parameters,
         );
         await connection.commit();
@@ -300,7 +311,7 @@ function createSqliteAdapter(connectionString: string): DatabaseAdapter {
     const names = database
       .prepare(
         `SELECT name FROM sqlite_master
-         WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+         WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%'
          ORDER BY name`,
       )
       .all() as MetadataRow[];
@@ -345,9 +356,13 @@ function createSqliteAdapter(connectionString: string): DatabaseAdapter {
     async query(queryText, parameters, maxRows) {
       const safeSql = assertReadOnlyQuery(queryText);
       const statement = database.prepare(capSubqueryRows(safeSql, maxRows));
-      const rows = normalizeRows(statement.all(...parameters) as MetadataRow[]);
+      const columns = statement.columns().map((column) => column.name);
+      const sqliteParameters = parameters.map((value) =>
+        typeof value === "boolean" ? Number(value) : value,
+      );
+      const rows = normalizeRows(statement.all(...sqliteParameters) as MetadataRow[]);
       return {
-        columns: rows[0] ? Object.keys(rows[0]) : [],
+        columns,
         rows: rows.slice(0, maxRows),
         rowCount: Math.min(rows.length, maxRows),
         truncated: rows.length > maxRows,
@@ -359,7 +374,7 @@ function createSqliteAdapter(connectionString: string): DatabaseAdapter {
   };
 }
 
-function parseSqlServerConfig(connectionString: string): sql.config {
+function parseSqlServerConfig(connectionString: string): string | sql.config {
   if (!/^mssql:|^sqlserver:/i.test(connectionString)) {
     return connectionString;
   }
@@ -391,9 +406,10 @@ async function createSqlServerAdapter(connectionString: string): Promise<Databas
     const columns = await pool.request().query<MetadataRow>(
       `SELECT s.name AS schema_name, t.name AS table_name, c.name AS column_name,
               TYPE_NAME(c.user_type_id) AS data_type, c.is_nullable
-       FROM sys.tables t
+       FROM sys.objects t
        JOIN sys.schemas s ON s.schema_id = t.schema_id
        JOIN sys.columns c ON c.object_id = t.object_id
+       WHERE t.type IN ('U', 'V') AND t.is_ms_shipped = 0
        ORDER BY s.name, t.name, c.column_id`,
     );
     for (const row of columns.recordset) {
@@ -412,24 +428,18 @@ async function createSqlServerAdapter(connectionString: string): Promise<Databas
 
     const constraints = await pool.request().query<MetadataRow>(
       `SELECT s.name AS schema_name, t.name AS table_name, c.name AS column_name,
-              i.name AS constraint_name, rt.name AS referenced_table_name,
-              rs.name AS referenced_schema_name, rc.name AS referenced_column_name,
-              CASE WHEN fk.object_id IS NULL THEN 0 ELSE 1 END AS is_foreign_key
+              i.name AS constraint_name, CAST(NULL AS NVARCHAR(128)) AS referenced_table_name,
+              CAST(NULL AS NVARCHAR(128)) AS referenced_schema_name,
+              CAST(NULL AS NVARCHAR(128)) AS referenced_column_name,
+              CAST(1 AS bit) AS is_primary_key, CAST(0 AS bit) AS is_foreign_key
        FROM sys.tables t
        JOIN sys.schemas s ON s.schema_id = t.schema_id
        JOIN sys.indexes i ON i.object_id = t.object_id AND i.is_primary_key = 1
        JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id
        JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
-       LEFT JOIN sys.foreign_key_columns fkc
-         ON fkc.parent_object_id = t.object_id AND fkc.parent_column_id = c.column_id
-       LEFT JOIN sys.tables rt ON rt.object_id = fkc.referenced_object_id
-       LEFT JOIN sys.schemas rs ON rs.schema_id = rt.schema_id
-       LEFT JOIN sys.columns rc
-         ON rc.object_id = fkc.referenced_object_id
-        AND rc.column_id = fkc.referenced_column_id
-       LEFT JOIN sys.foreign_keys fk ON fk.object_id = fkc.constraint_object_id
        UNION ALL
-       SELECT s.name, t.name, c.name, fk.name, rt.name, rs.name, rc.name, 1
+       SELECT s.name, t.name, c.name, fk.name, rt.name, rs.name, rc.name,
+              CAST(0 AS bit) AS is_primary_key, CAST(1 AS bit) AS is_foreign_key
        FROM sys.foreign_key_columns fkc
        JOIN sys.foreign_keys fk ON fk.object_id = fkc.constraint_object_id
        JOIN sys.tables t ON t.object_id = fkc.parent_object_id
@@ -440,7 +450,8 @@ async function createSqlServerAdapter(connectionString: string): Promise<Databas
        JOIN sys.columns rc ON rc.object_id = rt.object_id AND rc.column_id = fkc.referenced_column_id`,
     );
     for (const row of constraints.recordset) {
-      addConstraint(tables, row, row["is_foreign_key"] ? "foreign" : "primary");
+      if (row["is_primary_key"]) addConstraint(tables, row, "primary");
+      if (row["is_foreign_key"]) addConstraint(tables, row, "foreign");
     }
     return orderSchema(tables);
   };
@@ -455,11 +466,8 @@ async function createSqlServerAdapter(connectionString: string): Promise<Databas
       await transaction.begin(sql.ISOLATION_LEVEL.READ_COMMITTED);
       try {
         const request = new sql.Request(transaction);
-        request.timeout = queryTimeout;
-        const placeholders = [...query.matchAll(/\?|\b@p(\d+)\b/gi)];
-        const count = Math.max(parameters.length, placeholders.length);
-        for (let index = 0; index < count; index += 1) {
-          request.input(`p${index + 1}`, parameters[index] ?? null);
+        for (const [index, parameter] of parameters.entries()) {
+          request.input(`p${index + 1}`, parameter);
         }
         const result = await request.query(replaceQuestionMarks(query));
         await transaction.commit();
@@ -559,8 +567,12 @@ export function formatSchemaName(table: TableSchema): string {
   return `${table.schema}.${table.name}`;
 }
 
-export function formatSchema(table: TableSchema): string {
-  const columns = table.columns.map((column) => {
+export function formatSchema(
+  table: TableSchema,
+  selectedColumns: ColumnSchema[] = table.columns,
+  totalColumnCount = table.columns.length,
+): string {
+  const columns = selectedColumns.slice(0, 80).map((column) => {
     const flags = [
       column.primaryKey ? "primary key" : "",
       column.foreignKey
@@ -570,6 +582,12 @@ export function formatSchema(table: TableSchema): string {
     ].filter(Boolean);
     return `  - ${column.name}: ${column.type} (${flags.join(", ")})`;
   });
+  const omitted = Math.max(0, totalColumnCount - columns.length);
+  if (omitted > 0) {
+    columns.push(
+      `  - ${omitted} additional columns omitted; use a narrower search or select only needed fields.`,
+    );
+  }
   return `Table ${formatSchemaName(table)}\n${columns.join("\n")}`;
 }
 
