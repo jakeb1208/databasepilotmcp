@@ -1,3 +1,15 @@
+Human written README:
+
+Database pilot is an mcp server that it multi user. It is read only.
+Database connections are made at https://workspaceapi-server-production-811c.up.railway.app/. 
+
+The purpose of the mcp is to 
+
+
+
+
+
+
 # Database Pilot
 
 Database Pilot is a multi-user, read-only MCP service. Each account saves its
